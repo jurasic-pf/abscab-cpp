@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace abscab {
@@ -1571,6 +1572,53 @@ void kernelMagneticFieldPolygonFilament(
 
 // --------------------------------------------------
 
+static void polygonFilamentSoA(
+		bool potential, int numVertices,
+		const double *vx, const double *vy, const double *vz, double current,
+		int numEvalPos, const double *ex, const double *ey, const double *ez,
+		double *ox, double *oy, double *oz,
+		int numProcessors, bool useCompensatedSummation);
+
+// array-of-structs interface: convert to SoA and add the result to the target
+static void polygonFilamentAoS(
+		bool potential, int numVertices, const double *vertices, double current,
+		int numEvalPos, const double *evalPos, double *target,
+		int numProcessors, bool useCompensatedSummation) {
+	if (numVertices < 2 || numProcessors < 1 || current == 0.0) {
+		// let the SoA routine report the problem
+		polygonFilamentSoA(potential, numVertices, NULL, NULL, NULL, current, 0, NULL, NULL, NULL,
+				NULL, NULL, NULL, numProcessors, useCompensatedSummation);
+		return;
+	}
+	const size_t nv = (size_t) numVertices, ne = (size_t) numEvalPos;
+	double *buffer = (double *) calloc(3 * nv + 6 * ne, sizeof(double));
+	if (buffer == NULL) {
+		printf("failed to allocate temporary arrays\n");
+		return;
+	}
+	double *v[3] = {buffer, buffer + nv, buffer + 2 * nv};
+	double *e[3] = {buffer + 3 * nv, buffer + 3 * nv + ne, buffer + 3 * nv + 2 * ne};
+	double *o[3] = {buffer + 3 * nv + 3 * ne, buffer + 3 * nv + 4 * ne, buffer + 3 * nv + 5 * ne};
+	for (size_t i = 0; i < nv; ++i) {
+		for (int c = 0; c < 3; ++c) {
+			v[c][i] = vertices[3 * i + c];
+		}
+	}
+	for (size_t i = 0; i < ne; ++i) {
+		for (int c = 0; c < 3; ++c) {
+			e[c][i] = evalPos[3 * i + c];
+		}
+	}
+	polygonFilamentSoA(potential, numVertices, v[0], v[1], v[2], current, numEvalPos, e[0], e[1], e[2],
+			o[0], o[1], o[2], numProcessors, useCompensatedSummation);
+	for (size_t i = 0; i < ne; ++i) {
+		for (int c = 0; c < 3; ++c) {
+			target[3 * i + c] += o[c][i];
+		}
+	}
+	free(buffer);
+}
+
 /**
  * Compute the magnetic vector potential of a polygon filament
  * at a number of evaluation locations.
@@ -1594,166 +1642,8 @@ void vectorPotentialPolygonFilament(
 		double *vectorPotential,
 		int numProcessors,
 		bool useCompensatedSummation) {
-
-	if (numVertices < 2) {
-		printf("need at least 2 vertices, but only got %d\n", numVertices);
-		return;
-	}
-
-	// number of straight wire segments
-	int numSegments = numVertices - 1;
-
-	if (numProcessors < 1) {
-		printf("need at least 1 processor, but only got %d\n", numProcessors);
-		return;
-	}
-
-	if (current == 0.0) {
-		return;
-	}
-
-	if (numProcessors == 1) {
-		// single-threaded call
-		int idxSourceStart = 0;
-		int idxSourceEnd   = numSegments;
-		int idxEvalStart   = 0;
-		int idxEvalEnd     = numEvalPos;
-		kernelVectorPotentialPolygonFilament(
-				vertices, current,
-				evalPos,
-				vectorPotential,
-				idxSourceStart, idxSourceEnd, idxEvalStart, idxEvalEnd,
-				useCompensatedSummation);
-	} else {
-		// use multithreading
-
-		if (numSegments > numEvalPos) {
-			// parallelize over numSegments
-
-			// Note that each thread needs its own copy of the vectorPotential array,
-			// so this approach might need quite some memory in case the number of
-			// threads and the number of evaluation points is large.
-
-			int nThreads;
-			int nSourcePerThread;
-			int nSourceRemainder;
-			if (numSegments < numProcessors) {
-				nThreads = numSegments;
-
-				nSourcePerThread = 1;
-				nSourceRemainder = 0;
-			} else {
-				nThreads = numProcessors;
-
-				nSourcePerThread = numSegments / nThreads;
-				nSourceRemainder = numSegments % nThreads;
-			}
-			
-			int idxEvalStart   = 0;
-			int idxEvalEnd     = numEvalPos;
-
-			int numBytes = nThreads * numEvalPos * 3 * sizeof(double);
-			double *vectorPotentialContributions = (double *) malloc(numBytes);
-			if (vectorPotentialContributions == NULL) {
-				printf("failed to allocate temporary array for vector potential contributions\n");
-				return;
-			}
-			memset(vectorPotentialContributions, 0, numBytes);
-
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif // _OPENMP
-			for (int idxThread = 0; idxThread < nThreads; ++idxThread) {
-
-				int idxSourceStart =  idxThread      * nSourcePerThread;
-				int idxSourceEnd   = (idxThread + 1) * nSourcePerThread;
-				if (idxThread < nSourceRemainder) {
-					idxSourceStart += idxThread;
-					idxSourceEnd   += idxThread + 1;
-				} else {
-					idxSourceStart += nSourceRemainder;
-					idxSourceEnd   += nSourceRemainder;
-				}
-
-				kernelVectorPotentialPolygonFilament(
-						vertices, current,
-						evalPos,
-						&(vectorPotentialContributions[idxThread * numEvalPos * 3]),
-						idxSourceStart, idxSourceEnd, idxEvalStart, idxEvalEnd,
-						useCompensatedSummation);
-			}
-
-			// sum up contributions from source chunks
-			if (useCompensatedSummation) {
-				for (int i = 0; i < numEvalPos; ++i) {
-					double sumX[3] = { 0.0, 0.0, 0.0 };
-					double sumY[3] = { 0.0, 0.0, 0.0 };
-					double sumZ[3] = { 0.0, 0.0, 0.0 };
-					for (int idxThread = 0; idxThread < nThreads; ++idxThread) {
-						// TODO: bad memory access pattern here --> potential bottleneck !!!
-						compAdd(vectorPotentialContributions[(idxThread * numEvalPos + i) * 3 + 0], sumX);
-						compAdd(vectorPotentialContributions[(idxThread * numEvalPos + i) * 3 + 1], sumY);
-						compAdd(vectorPotentialContributions[(idxThread * numEvalPos + i) * 3 + 2], sumZ);
-					}
-					vectorPotential[i * 3 + 0] += sumX[0] + sumX[1] + sumX[2];
-					vectorPotential[i * 3 + 1] += sumY[0] + sumY[1] + sumY[2];
-					vectorPotential[i * 3 + 2] += sumZ[0] + sumZ[1] + sumZ[2];
-				}
-			} else {
-				for (int idxThread = 0; idxThread < nThreads; ++idxThread) {
-					for (int i = 0; i < numEvalPos; ++i) {
-						vectorPotential[i * 3 + 0] += vectorPotentialContributions[(idxThread * numEvalPos + i) * 3 + 0];
-						vectorPotential[i * 3 + 1] += vectorPotentialContributions[(idxThread * numEvalPos + i) * 3 + 1];
-						vectorPotential[i * 3 + 2] += vectorPotentialContributions[(idxThread * numEvalPos + i) * 3 + 2];
-					}
-				}
-			}
-
-			free(vectorPotentialContributions);
-		} else { // numEvalPos > numSegments
-			// parallelize over numEvalPos
-
-			int nThreads;
-			int idxSourceStart = 0;
-			int idxSourceEnd   = numSegments;
-			int nEvalPerThread;
-			int nEvalRemainder;
-			if (numEvalPos < numProcessors) {
-				nThreads = numEvalPos;
-
-				nEvalPerThread = 1;
-				nEvalRemainder = 0;
-			} else {
-				nThreads = numProcessors;
-
-				nEvalPerThread = numEvalPos / nThreads;
-				nEvalRemainder = numEvalPos % nThreads;
-			}
-
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif // _OPENMP
-			for (int idxThread = 0; idxThread < nThreads; ++idxThread) {
-
-				int idxEvalStart =  idxThread      * nEvalPerThread;
-				int idxEvalEnd   = (idxThread + 1) * nEvalPerThread;
-				if (idxThread < nEvalRemainder) {
-					idxEvalStart += idxThread;
-					idxEvalEnd   += idxThread + 1;
-				} else {
-					idxEvalStart += nEvalRemainder;
-					idxEvalEnd   += nEvalRemainder;
-				}
-
-				kernelVectorPotentialPolygonFilament(
-						vertices, current,
-						evalPos,
-						vectorPotential,
-						idxSourceStart, idxSourceEnd, idxEvalStart, idxEvalEnd,
-						useCompensatedSummation);
-			}
-		} // parallelize over numSegments or numEvalPos
-	} // parallelization
+	polygonFilamentAoS(true, numVertices, vertices, current, numEvalPos, evalPos, vectorPotential,
+			numProcessors, useCompensatedSummation);
 }
 
 /**
@@ -1963,166 +1853,8 @@ void magneticFieldPolygonFilament(
 		double *magneticField,
 		int numProcessors,
 		bool useCompensatedSummation) {
-
-	if (numVertices < 2) {
-		printf("need at least 2 vertices, but only got %d\n", numVertices);
-		return;
-	}
-
-	// number of straight wire segments
-	int numSegments = numVertices - 1;
-
-	if (numProcessors < 1) {
-		printf("need at least 1 processor, but only got %d\n", numProcessors);
-		return;
-	}
-
-	if (current == 0.0) {
-		return;
-	}
-
-	if (numProcessors == 1) {
-		// single-threaded call
-		int idxSourceStart = 0;
-		int idxSourceEnd   = numSegments;
-		int idxEvalStart   = 0;
-		int idxEvalEnd     = numEvalPos;
-		kernelMagneticFieldPolygonFilament(
-				vertices, current,
-				evalPos,
-				magneticField,
-				idxSourceStart, idxSourceEnd, idxEvalStart, idxEvalEnd,
-				useCompensatedSummation);
-	} else {
-		// use multithreading
-
-		if (numSegments > numEvalPos) {
-			// parallelize over numSegments
-
-			// Note that each thread needs its own copy of the vectorPotential array,
-			// so this approach might need quite some memory in case the number of
-			// threads and the number of evaluation points is large.
-
-			int nThreads;
-			int nSourcePerThread;
-			int nSourceRemainder;
-			if (numSegments < numProcessors) {
-				nThreads = numSegments;
-
-				nSourcePerThread = 1;
-				nSourceRemainder = 0;
-			} else {
-				nThreads = numProcessors;
-
-				nSourcePerThread = numSegments / nThreads;
-				nSourceRemainder = numSegments % nThreads;
-			}
-			
-			int idxEvalStart   = 0;
-			int idxEvalEnd     = numEvalPos;
-
-			int numBytes = nThreads * numEvalPos * 3 * sizeof(double);
-			double *magneticFieldContributions = (double *) malloc(numBytes);
-			if (magneticFieldContributions == NULL) {
-				printf("failed to allocate temporary array for magnetic field contributions\n");
-				return;
-			}
-			memset(magneticFieldContributions, 0, numBytes);
-
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif // _OPENMP
-			for (int idxThread = 0; idxThread < nThreads; ++idxThread) {
-				
-				int idxSourceStart =  idxThread      * nSourcePerThread;
-				int idxSourceEnd   = (idxThread + 1) * nSourcePerThread;
-				if (idxThread < nSourceRemainder) {
-					idxSourceStart += idxThread;
-					idxSourceEnd   += idxThread + 1;
-				} else {
-					idxSourceStart += nSourceRemainder;
-					idxSourceEnd   += nSourceRemainder;
-				}
-
-				kernelMagneticFieldPolygonFilament(
-						vertices, current,
-						evalPos,
-						&(magneticFieldContributions[idxThread * numEvalPos * 3]),
-						idxSourceStart, idxSourceEnd, idxEvalStart, idxEvalEnd,
-						useCompensatedSummation);
-			}
-
-			// sum up contributions from source chunks
-			if (useCompensatedSummation) {
-				for (int i=0; i<numEvalPos; ++i) {
-					double sumX[3] = { 0.0, 0.0, 0.0 };
-					double sumY[3] = { 0.0, 0.0, 0.0 };
-					double sumZ[3] = { 0.0, 0.0, 0.0 };
-					for (int idxThread = 0; idxThread < nThreads; ++idxThread) {
-						// TODO: bad memory access pattern here --> potential bottleneck !!!
-						compAdd(magneticFieldContributions[(idxThread * numEvalPos + i) * 3 + 0], sumX);
-						compAdd(magneticFieldContributions[(idxThread * numEvalPos + i) * 3 + 1], sumY);
-						compAdd(magneticFieldContributions[(idxThread * numEvalPos + i) * 3 + 2], sumZ);
-					}
-					magneticField[i * 3 + 0] += sumX[0] + sumX[1] + sumX[2];
-					magneticField[i * 3 + 1] += sumY[0] + sumY[1] + sumY[2];
-					magneticField[i * 3 + 2] += sumZ[0] + sumZ[1] + sumZ[2];
-				}
-			} else {
-				for (int idxThread = 0; idxThread < nThreads; ++idxThread) {
-					for (int i = 0; i < numEvalPos; ++i) {
-						magneticField[i * 3 + 0] += magneticFieldContributions[(idxThread * numEvalPos + i) * 3 + 0];
-						magneticField[i * 3 + 1] += magneticFieldContributions[(idxThread * numEvalPos + i) * 3 + 1];
-						magneticField[i * 3 + 2] += magneticFieldContributions[(idxThread * numEvalPos + i) * 3 + 2];
-					}
-				}
-			}
-
-			free(magneticFieldContributions);
-		} else { // numEvalPos > numSegments
-			// parallelize over numEvalPos
-
-			int nThreads;
-			int idxSourceStart = 0;
-			int idxSourceEnd   = numSegments;
-			int nEvalPerThread;
-			int nEvalRemainder;
-			if (numEvalPos < numProcessors) {
-				nThreads = numEvalPos;
-
-				nEvalPerThread = 1;
-				nEvalRemainder = 0;
-			} else {
-				nThreads = numProcessors;
-
-				nEvalPerThread = numEvalPos / nThreads;
-				nEvalRemainder = numEvalPos % nThreads;
-			}
-
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif // _OPENMP
-			for (int idxThread = 0; idxThread < nThreads; ++idxThread) {
-				
-				int idxEvalStart =  idxThread      * nEvalPerThread;
-				int idxEvalEnd   = (idxThread + 1) * nEvalPerThread;
-				if (idxThread < nEvalRemainder) {
-					idxEvalStart += idxThread;
-					idxEvalEnd   += idxThread + 1;
-				} else {
-					idxEvalStart += nEvalRemainder;
-					idxEvalEnd   += nEvalRemainder;
-				}
-
-				kernelMagneticFieldPolygonFilament(
-						vertices, current,
-						evalPos,
-						magneticField,
-						idxSourceStart, idxSourceEnd, idxEvalStart, idxEvalEnd,
-						useCompensatedSummation);
-			}
-		} // parallelize over numSegments or numEvalPos
-	} // parallelization
+	polygonFilamentAoS(false, numVertices, vertices, current, numEvalPos, evalPos, magneticField,
+			numProcessors, useCompensatedSummation);
 }
 
 
@@ -2309,6 +2041,257 @@ void magneticFieldPolygonFilament(
 			}
 		} // parallelize over numSegments or numEvalPos
 	} // parallelization
+}
+
+/////// struct-of-arrays (SoA) polygon filament routines
+
+#define SOA_BLOCK 256
+
+// range of normalized coordinates in which sqrt(a*a + b*b) can replace hypot(a, b)
+#define SOA_MIN 1.0e-100
+#define SOA_MAX 1.0e100
+
+// GCC does not vectorize selects of trapping FP operations (-ftrapping-math).
+#if defined(__GNUC__) && !defined(__clang__)
+#define SOA_KERNEL __attribute__((optimize("no-trapping-math")))
+#else
+#define SOA_KERNEL
+#endif
+
+SOA_KERNEL static inline void compAddSoA(double c, double &s, double &cs, double &ccs) {
+	double t = s + c;
+	double c1 = (s - t) + c;
+	double c2 = (c - t) + s;
+	double d = (fabs(s) >= fabs(c)) ? c1 : c2;
+	s = t;
+	double t2 = cs + d;
+	double d1 = (cs - t2) + d;
+	double d2 = (d - t2) + cs;
+	cs = t2;
+	ccs += (fabs(cs) >= fabs(d)) ? d1 : d2;
+}
+
+// Fast path: sqrt-based far-field formulas on blocks of evaluation locations;
+// everything else (near field, axis, end planes, extreme magnitudes) uses the scalar routines.
+template <bool kMagneticField>
+SOA_KERNEL static void kernelPolygonFilamentSoA(
+		const double *vx, const double *vy, const double *vz, double current,
+		const double *ex, const double *ey, const double *ez,
+		double *ox, double *oy, double *oz,
+		int idxSourceStart, int idxSourceEnd, int idxEvalStart, int idxEvalEnd,
+		bool useCompensatedSummation) {
+
+	const double prefactor = kMagneticField ? MU_0_BY_4_PI * current : MU_0_BY_2_PI * current;
+
+	for (int i0 = idxEvalStart; i0 < idxEvalEnd; i0 += SOA_BLOCK) {
+		const int n = (idxEvalEnd - i0 < SOA_BLOCK) ? (idxEvalEnd - i0) : SOA_BLOCK;
+		const double *bx = ex + i0, *by = ey + i0, *bz = ez + i0;
+
+		double sx[SOA_BLOCK] = {}, csx[SOA_BLOCK] = {}, ccsx[SOA_BLOCK] = {};
+		double sy[SOA_BLOCK] = {}, csy[SOA_BLOCK] = {}, ccsy[SOA_BLOCK] = {};
+		double sz[SOA_BLOCK] = {}, csz[SOA_BLOCK] = {}, ccsz[SOA_BLOCK] = {};
+		double cx[SOA_BLOCK], cy[SOA_BLOCK], cz[SOA_BLOCK], val[SOA_BLOCK];
+		bool slow[SOA_BLOCK];
+
+		for (int k = idxSourceStart; k < idxSourceEnd; ++k) {
+			const double x_i = vx[k], y_i = vy[k], z_i = vz[k];
+			const double dx = vx[k + 1] - x_i, dy = vy[k + 1] - y_i, dz = vz[k + 1] - z_i;
+			const double l2 = dx * dx + dy * dy + dz * dz;
+			if (l2 == 0.0) {
+				continue;
+			}
+			const double l = sqrt(l2);
+			const double eX = dx / l, eY = dy / l, eZ = dz / l;
+			const double scale = kMagneticField ? prefactor / l : prefactor;
+
+#ifdef _OPENMP
+#pragma omp simd
+#endif // _OPENMP
+			for (int j = 0; j < n; ++j) {
+				const double r0x = bx[j] - x_i, r0y = by[j] - y_i, r0z = bz[j] - z_i;
+				const double alignedZ = eX * r0x + eY * r0y + eZ * r0z;
+				const double pX = r0x - alignedZ * eX, pY = r0y - alignedZ * eY, pZ = r0z - alignedZ * eZ;
+				const double alignedRSq = pX * pX + pY * pY + pZ * pZ;
+				const double alignedR = sqrt(alignedRSq);
+				const double rhoP = alignedR / l, zP = alignedZ / l, omz = 1 - zP;
+
+				// bitwise operators keep the loop free of control flow
+				const double mi = (rhoP > fabs(zP)) ? rhoP : fabs(zP);
+				const double mf = (rhoP > fabs(omz)) ? rhoP : fabs(omz);
+				const bool far = kMagneticField ? ((rhoP >= zP) | (rhoP >= omz) | (zP < 0.0) | (zP > 1.0))
+						: ((rhoP >= 1.0) | (zP <= -1.0) | (zP > 2.0));
+				const bool fast = (kMagneticField ? (alignedRSq > 0.0) : (rhoP != 0.0)) & (zP != 0.0) & (zP != 1.0) & far
+						& (mi >= SOA_MIN) & (mi <= SOA_MAX) & (mf >= SOA_MIN) & (mf <= SOA_MAX);
+
+				const double r_i = sqrt(rhoP * rhoP + zP * zP), r_f = sqrt(rhoP * rhoP + omz * omz);
+				// B_phi is zero on the axis, so only locations off the axis need the scalar path
+				slow[j] = (!fast) & (!kMagneticField | (alignedRSq > 0.0));
+				if (kMagneticField) {
+					const double bPhi = fast ? scale * (rhoP * (1 / r_i + 1 / r_f)) / (rhoP * rhoP - zP * omz + r_i * r_f) : 0.0;
+					const double inv = fast ? 1 / alignedR : 0.0;
+					cx[j] = bPhi * (eY * pZ - eZ * pY) * inv;
+					cy[j] = bPhi * (eZ * pX - eX * pZ) * inv;
+					cz[j] = bPhi * (eX * pY - eY * pX) * inv;
+				} else {
+					val[j] = fast ? 1 / (r_i + r_f) : 0.5;
+				}
+			}
+
+			for (int j = 0; j < n; ++j) {
+				if (!kMagneticField && !slow[j]) {
+					val[j] = scale * atanh(val[j]); // not vectorizable
+				}
+				if (!slow[j]) {
+					continue;
+				}
+				const double r0x = bx[j] - x_i, r0y = by[j] - y_i, r0z = bz[j] - z_i;
+				const double alignedZ = eX * r0x + eY * r0y + eZ * r0z;
+				const double pX = r0x - alignedZ * eX, pY = r0y - alignedZ * eY, pZ = r0z - alignedZ * eZ;
+				const double alignedR = sqrt(pX * pX + pY * pY + pZ * pZ);
+				if (kMagneticField) {
+					const double bPhi = scale * straightWireSegment_B_phi(alignedR / l, alignedZ / l) / alignedR;
+					cx[j] = bPhi * (eY * pZ - eZ * pY);
+					cy[j] = bPhi * (eZ * pX - eX * pZ);
+					cz[j] = bPhi * (eX * pY - eY * pX);
+				} else {
+					val[j] = scale * straightWireSegment_A_z(alignedR / l, alignedZ / l);
+				}
+			}
+
+			if (!kMagneticField) {
+				for (int j = 0; j < n; ++j) {
+					cx[j] = val[j] * eX;
+					cy[j] = val[j] * eY;
+					cz[j] = val[j] * eZ;
+				}
+			}
+
+			if (useCompensatedSummation) {
+#ifdef _OPENMP
+#pragma omp simd
+#endif // _OPENMP
+				for (int j = 0; j < n; ++j) {
+					compAddSoA(cx[j], sx[j], csx[j], ccsx[j]);
+					compAddSoA(cy[j], sy[j], csy[j], ccsy[j]);
+					compAddSoA(cz[j], sz[j], csz[j], ccsz[j]);
+				}
+			} else {
+				for (int j = 0; j < n; ++j) {
+					sx[j] += cx[j];
+					sy[j] += cy[j];
+					sz[j] += cz[j];
+				}
+			}
+		}
+
+		for (int j = 0; j < n; ++j) {
+			ox[i0 + j] += sx[j] + csx[j] + ccsx[j];
+			oy[i0 + j] += sy[j] + csy[j] + ccsy[j];
+			oz[i0 + j] += sz[j] + csz[j] + ccsz[j];
+		}
+	}
+}
+
+void kernelMagneticFieldPolygonFilament(
+		const double *vx, const double *vy, const double *vz, double current,
+		const double *ex, const double *ey, const double *ez,
+		double *bx, double *by, double *bz,
+		int idxSourceStart, int idxSourceEnd, int idxEvalStart, int idxEvalEnd,
+		bool useCompensatedSummation) {
+	kernelPolygonFilamentSoA<true>(vx, vy, vz, current, ex, ey, ez, bx, by, bz,
+			idxSourceStart, idxSourceEnd, idxEvalStart, idxEvalEnd, useCompensatedSummation);
+}
+
+void kernelVectorPotentialPolygonFilament(
+		const double *vx, const double *vy, const double *vz, double current,
+		const double *ex, const double *ey, const double *ez,
+		double *ax, double *ay, double *az,
+		int idxSourceStart, int idxSourceEnd, int idxEvalStart, int idxEvalEnd,
+		bool useCompensatedSummation) {
+	kernelPolygonFilamentSoA<false>(vx, vy, vz, current, ex, ey, ez, ax, ay, az,
+			idxSourceStart, idxSourceEnd, idxEvalStart, idxEvalEnd, useCompensatedSummation);
+}
+
+static void polygonFilamentSoA(
+		bool potential, int numVertices,
+		const double *vx, const double *vy, const double *vz, double current,
+		int numEvalPos, const double *ex, const double *ey, const double *ez,
+		double *ox, double *oy, double *oz,
+		int numProcessors, bool useCompensatedSummation) {
+
+	if (numVertices < 2) {
+		printf("need at least 2 vertices, but only got %d\n", numVertices);
+		return;
+	}
+	if (numProcessors < 1) {
+		printf("need at least 1 processor, but only got %d\n", numProcessors);
+		return;
+	}
+	if (current == 0.0) {
+		return;
+	}
+
+	const int numSegments = numVertices - 1;
+	auto kernel = potential ? kernelPolygonFilamentSoA<false> : kernelPolygonFilamentSoA<true>;
+
+	if (numProcessors > 1 && numSegments > numEvalPos) {
+		// parallelize over segments, with one output array per thread
+		const int nThreads = numSegments < numProcessors ? numSegments : numProcessors;
+		const size_t stride = (size_t) numEvalPos;
+		double *partial = (double *) calloc(3 * nThreads * stride, sizeof(double));
+		if (partial == NULL) {
+			printf("failed to allocate temporary array for contributions\n");
+			return;
+		}
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif // _OPENMP
+		for (int t = 0; t < nThreads; ++t) {
+			double *p = partial + 3 * t * stride;
+			kernel(vx, vy, vz, current, ex, ey, ez, p, p + stride, p + 2 * stride,
+					(int) ((long) numSegments * t / nThreads), (int) ((long) numSegments * (t + 1) / nThreads),
+					0, numEvalPos, useCompensatedSummation);
+		}
+		for (int i = 0; i < numEvalPos; ++i) {
+			double sum[3][3] = {};
+			for (int t = 0; t < nThreads; ++t) {
+				for (int c = 0; c < 3; ++c) {
+					compAdd(partial[(3 * t + c) * stride + i], sum[c]);
+				}
+			}
+			ox[i] += sum[0][0] + sum[0][1] + sum[0][2];
+			oy[i] += sum[1][0] + sum[1][1] + sum[1][2];
+			oz[i] += sum[2][0] + sum[2][1] + sum[2][2];
+		}
+		free(partial);
+	} else {
+		// parallelize over evaluation locations
+		const int nThreads = numEvalPos < numProcessors ? numEvalPos : numProcessors;
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif // _OPENMP
+		for (int t = 0; t < nThreads; ++t) {
+			kernel(vx, vy, vz, current, ex, ey, ez, ox, oy, oz, 0, numSegments,
+					(int) ((long) numEvalPos * t / nThreads), (int) ((long) numEvalPos * (t + 1) / nThreads),
+					useCompensatedSummation);
+		}
+	}
+}
+
+void magneticFieldPolygonFilament(
+		int numVertices, const double *vx, const double *vy, const double *vz, double current,
+		int numEvalPos, const double *ex, const double *ey, const double *ez,
+		double *bx, double *by, double *bz, int numProcessors, bool useCompensatedSummation) {
+	polygonFilamentSoA(false, numVertices, vx, vy, vz, current, numEvalPos, ex, ey, ez, bx, by, bz,
+			numProcessors, useCompensatedSummation);
+}
+
+void vectorPotentialPolygonFilament(
+		int numVertices, const double *vx, const double *vy, const double *vz, double current,
+		int numEvalPos, const double *ex, const double *ey, const double *ez,
+		double *ax, double *ay, double *az, int numProcessors, bool useCompensatedSummation) {
+	polygonFilamentSoA(true, numVertices, vx, vy, vz, current, numEvalPos, ex, ey, ez, ax, ay, az,
+			numProcessors, useCompensatedSummation);
 }
 
 } // namespace abscab

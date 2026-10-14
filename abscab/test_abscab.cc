@@ -1,6 +1,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <vector>
+
 #include "abscab.hh"
 
 #include "abscab-cpp/test_util/test_util.hh"
@@ -648,5 +651,161 @@ TEST(TestAbscab, CheckPreseverancePolygonFilamentVertexSupplier) {
 
 
 
+/////// struct-of-arrays polygon filament routines
+
+namespace {
+
+typedef std::vector<double> Vec;
+
+// SoA output of both routines for a polygon given as (x, y, z) arrays; bx.. and ax.. start at zero
+struct SoAResult { Vec bx, by, bz, ax, ay, az; };
+
+SoAResult runSoA(const Vec &vx, const Vec &vy, const Vec &vz, const Vec &ex, const Vec &ey, const Vec &ez,
+		int numProcessors = 1, bool compensated = true) {
+	int ne = (int) ex.size();
+	SoAResult r = {Vec(ne), Vec(ne), Vec(ne), Vec(ne), Vec(ne), Vec(ne)};
+	magneticFieldPolygonFilament((int) vx.size(), vx.data(), vy.data(), vz.data(), 1.0, ne,
+			ex.data(), ey.data(), ez.data(), r.bx.data(), r.by.data(), r.bz.data(), numProcessors, compensated);
+	vectorPotentialPolygonFilament((int) vx.size(), vx.data(), vy.data(), vz.data(), 1.0, ne,
+			ex.data(), ey.data(), ez.data(), r.ax.data(), r.ay.data(), r.az.data(), numProcessors, compensated);
+	return r;
+}
+
+// largest |a - b| / |b| over the locations (all three components together)
+double maxRelDiff(const Vec &ax, const Vec &ay, const Vec &az, const Vec &bx, const Vec &by, const Vec &bz) {
+	double worst = 0.0;
+	for (size_t i = 0; i < ax.size(); ++i) {
+		double n = std::sqrt(bx[i] * bx[i] + by[i] * by[i] + bz[i] * bz[i]);
+		double d = std::sqrt(pow(ax[i] - bx[i], 2) + pow(ay[i] - by[i], 2) + pow(az[i] - bz[i], 2));
+		worst = std::max(worst, n > 0.0 ? d / n : d);
+	}
+	return worst;
+}
+
+// scalar AoS kernels (hypot-based) as the reference
+SoAResult runScalar(const Vec &vx, const Vec &vy, const Vec &vz, const Vec &ex, const Vec &ey, const Vec &ez, bool compensated = true) {
+	int nv = (int) vx.size(), ne = (int) ex.size();
+	Vec v(3 * nv), e(3 * ne), b(3 * ne, 0.0), a(3 * ne, 0.0);
+	for (int i = 0; i < nv; ++i) { v[3 * i] = vx[i]; v[3 * i + 1] = vy[i]; v[3 * i + 2] = vz[i]; }
+	for (int i = 0; i < ne; ++i) { e[3 * i] = ex[i]; e[3 * i + 1] = ey[i]; e[3 * i + 2] = ez[i]; }
+	kernelMagneticFieldPolygonFilament(v.data(), 1.0, e.data(), b.data(), 0, nv - 1, 0, ne, compensated);
+	kernelVectorPotentialPolygonFilament(v.data(), 1.0, e.data(), a.data(), 0, nv - 1, 0, ne, compensated);
+	SoAResult r = {Vec(ne), Vec(ne), Vec(ne), Vec(ne), Vec(ne), Vec(ne)};
+	for (int i = 0; i < ne; ++i) {
+		r.bx[i] = b[3 * i]; r.by[i] = b[3 * i + 1]; r.bz[i] = b[3 * i + 2];
+		r.ax[i] = a[3 * i]; r.ay[i] = a[3 * i + 1]; r.az[i] = a[3 * i + 2];
+	}
+	return r;
+}
+
+} // namespace
+
+// the reference data of CheckStraightWireSegment, evaluated through the SoA polygon routines
+TEST(TestAbscab, CheckStraightWireSegmentSoA) {
+	int rows, cols;
+	double **rp = loadColumnsFromFile("abscab-cpp/abscab/resources/testPointsRpStraightWireSegment.dat", &rows, &cols);
+	double **zp = loadColumnsFromFile("abscab-cpp/abscab/resources/testPointsZpStraightWireSegment.dat", &rows, &cols);
+	double **aZRef = loadColumnsFromFile("abscab-cpp/abscab/resources/StraightWireSegment_A_z_ref.dat", &rows, &cols);
+	double **bPhiRef = loadColumnsFromFile("abscab-cpp/abscab/resources/StraightWireSegment_B_phi_ref.dat", &rows, &cols);
+
+	// unit segment along x: z' is x and rho' is y, so A_z is A_x and B_phi is B_z
+	Vec ex(zp[0], zp[0] + rows), ey(rp[0], rp[0] + rows), ez(rows, 0.0);
+	SoAResult r = runSoA({0.0, 1.0}, {0.0, 0.0}, {0.0, 0.0}, ex, ey, ez);
+
+	for (int i = 0; i < rows; ++i) {
+		double a = r.ax[i] / (MU_0 / (2.0 * M_PI));
+		EXPECT_LT(fabs(a - aZRef[0][i]), 1.0e-15 * fabs(aZRef[0][i]) + 1.0e-300) << "A_z rho' " << ey[i] << " z' " << ex[i];
+		if (ey[i] != 0.0) {
+			double b = r.bz[i] / (MU_0 / (4.0 * M_PI));
+			EXPECT_LT(fabs(b - bPhiRef[0][i]), 1.0e-15 * fabs(bPhiRef[0][i]) + 1.0e-300) << "B_phi rho' " << ey[i] << " z' " << ex[i];
+		}
+	}
+	free(rp[0]); free(rp); free(zp[0]); free(zp); free(aZRef[0]); free(aZRef); free(bPhiRef[0]); free(bPhiRef);
+}
+
+// all regimes of a coil: generic, on the axis, end planes, near field, and the different parallelizations
+TEST(TestAbscab, CheckPolygonFilamentSoAMatchesScalar) {
+	Vec vx, vy, vz;
+	for (int i = 0; i < 40; ++i) {
+		double t = 2.0 * M_PI * i / 39;
+		vx.push_back((1.0 + 0.3 * cos(t)) * cos(0.2 * sin(t)));
+		vy.push_back((1.0 + 0.3 * cos(t)) * sin(0.2 * sin(t)));
+		vz.push_back(0.3 * sin(t) + 0.01 * t);
+		if (i == 10) { // zero-length segment
+			vx.push_back(vx.back()); vy.push_back(vy.back()); vz.push_back(vz.back());
+		}
+	}
+	Vec ex, ey, ez;
+	for (int i = 0; i < 1000; ++i) { // generic locations; not a multiple of the block size
+		ex.push_back(1.0 + 1.5 * sin(1.3 * i)); ey.push_back(1.5 * sin(2.9 * i + 1)); ez.push_back(0.8 * sin(0.7 * i + 2));
+	}
+	const double along[] = {-3.0, -0.5, 0.0, 0.3, 0.5, 1.0, 1.2, 1.5, 2.0};
+	const double perp[] = {0.0, 1e-14, 1e-9, 1e-3, 0.2, 0.5, 3.0};
+	for (int seg : {0, 5, 11, 20, 37}) {
+		double d[3] = {vx[seg + 1] - vx[seg], vy[seg + 1] - vy[seg], vz[seg + 1] - vz[seg]};
+		double l = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+		double px = -d[1] / hypot(d[0], d[1]), py = d[0] / hypot(d[0], d[1]); // perpendicular to the segment
+		for (double a : along) {
+			for (double q : perp) {
+				ex.push_back(vx[seg] + a * d[0] + q * l * px);
+				ey.push_back(vy[seg] + a * d[1] + q * l * py);
+				ez.push_back(vz[seg] + a * d[2]);
+			}
+		}
+	}
+
+	for (bool compensated : {true, false}) {
+		SoAResult ref = runScalar(vx, vy, vz, ex, ey, ez, compensated);
+		for (int numProcessors : {1, 3}) {
+			SoAResult r = runSoA(vx, vy, vz, ex, ey, ez, numProcessors, compensated);
+			EXPECT_LT(maxRelDiff(r.bx, r.by, r.bz, ref.bx, ref.by, ref.bz), 2.0e-14);
+			EXPECT_LT(maxRelDiff(r.ax, r.ay, r.az, ref.ax, ref.ay, ref.az), 2.0e-14);
+		}
+	}
+
+	// many segments, few locations: parallelized over segments
+	Vec fx(ex.begin(), ex.begin() + 5), fy(ey.begin(), ey.begin() + 5), fz(ez.begin(), ez.begin() + 5);
+	SoAResult serial = runSoA(vx, vy, vz, fx, fy, fz, 1), threaded = runSoA(vx, vy, vz, fx, fy, fz, 8);
+	EXPECT_LT(maxRelDiff(threaded.bx, threaded.by, threaded.bz, serial.bx, serial.by, serial.bz), 1.0e-13);
+
+	// the public kernels on a sub-range of locations agree with the full routine
+	Vec kx(5, 0.0), ky(5, 0.0), kz(5, 0.0);
+	kernelMagneticFieldPolygonFilament(vx.data(), vy.data(), vz.data(), 1.0, fx.data(), fy.data(), fz.data(),
+			kx.data(), ky.data(), kz.data(), 0, (int) vx.size() - 1, 1, 3, true);
+	EXPECT_EQ(kx[0], 0.0);
+	EXPECT_EQ(kx[3], 0.0);
+	for (int i = 1; i < 3; ++i) {
+		EXPECT_EQ(kx[i], serial.bx[i]);
+		EXPECT_EQ(kz[i], serial.bz[i]);
+	}
+
+	// the array-of-structs routines give the same result as the SoA ones, and add to the target
+	Vec v(3 * vx.size()), e(3 * 5), b(3 * 5, 1.0);
+	for (size_t i = 0; i < vx.size(); ++i) { v[3 * i] = vx[i]; v[3 * i + 1] = vy[i]; v[3 * i + 2] = vz[i]; }
+	for (int i = 0; i < 5; ++i) { e[3 * i] = fx[i]; e[3 * i + 1] = fy[i]; e[3 * i + 2] = fz[i]; }
+	magneticFieldPolygonFilament((int) vx.size(), v.data(), 1.0, 5, e.data(), b.data(), 1, true);
+	for (int i = 0; i < 5; ++i) {
+		EXPECT_EQ(b[3 * i], 1.0 + serial.bx[i]);
+		EXPECT_EQ(b[3 * i + 2], 1.0 + serial.bz[i]);
+	}
+}
+
+// squares of these normalized coordinates under- or overflow: the scalar routines must take over
+TEST(TestAbscab, CheckPolygonFilamentSoAExtremeMagnitudes) {
+	for (double length : {1.0e150, 1.0e-150}) {
+		Vec ex, ey, ez;
+		for (double offset : {1e-12, 1e-8, 1e-3, 1.0, 1e3, 1e100}) {
+			for (double x : {offset, -offset, length + offset, 0.5 * length}) {
+				ex.push_back(x); ey.push_back(offset); ez.push_back(0.5 * offset);
+			}
+		}
+		Vec vx = {0.0, length}, vy = {0.0, 0.0}, vz = {0.0, 0.0};
+		SoAResult ref = runScalar(vx, vy, vz, ex, ey, ez), r = runSoA(vx, vy, vz, ex, ey, ez);
+		EXPECT_LT(maxRelDiff(r.bx, r.by, r.bz, ref.bx, ref.by, ref.bz), 1.0e-13) << "length " << length;
+		EXPECT_LT(maxRelDiff(r.ax, r.ay, r.az, ref.ax, ref.ay, ref.az), 1.0e-13) << "length " << length;
+	}
+}
+
 } // namespace abscab
+
 

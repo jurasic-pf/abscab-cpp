@@ -556,6 +556,67 @@ void magneticFieldPolygonFilament(
 #endif
 		bool useCompensatedSummation = true);
 
+/**
+ * Struct-of-arrays variants of the polygon filament routines above: each coordinate
+ * is a separate array, [numVertices] for vx, vy, vz and [numEvalPos] for the rest.
+ * Results are added to the targets (bx, by, bz or ax, ay, az).
+ * Generic far-field locations are vectorized and use sqrt(a*a + b*b) instead of hypot(a, b);
+ * all others use the scalar routines.
+ */
+void magneticFieldPolygonFilament(
+		int numVertices,
+		const double *vx, const double *vy, const double *vz,
+		double current,
+		int numEvalPos,
+		const double *ex, const double *ey, const double *ez,
+		double *bx, double *by, double *bz,
+#ifdef _OPENMP
+		int numProcessors = omp_get_max_threads(),
+#else
+		int numProcessors = 1,
+#endif
+		bool useCompensatedSummation = true);
+
+void vectorPotentialPolygonFilament(
+		int numVertices,
+		const double *vx, const double *vy, const double *vz,
+		double current,
+		int numEvalPos,
+		const double *ex, const double *ey, const double *ez,
+		double *ax, double *ay, double *az,
+#ifdef _OPENMP
+		int numProcessors = omp_get_max_threads(),
+#else
+		int numProcessors = 1,
+#endif
+		bool useCompensatedSummation = true);
+
+/**
+ * Struct-of-arrays kernels of the routines above for the segments [idxSourceStart, idxSourceEnd)
+ * and the evaluation locations [idxEvalStart, idxEvalEnd); no parallelization.
+ */
+void kernelMagneticFieldPolygonFilament(
+		const double *vx, const double *vy, const double *vz,
+		double current,
+		const double *ex, const double *ey, const double *ez,
+		double *bx, double *by, double *bz,
+		int idxSourceStart,
+		int idxSourceEnd,
+		int idxEvalStart,
+		int idxEvalEnd,
+		bool useCompensatedSummation);
+
+void kernelVectorPotentialPolygonFilament(
+		const double *vx, const double *vy, const double *vz,
+		double current,
+		const double *ex, const double *ey, const double *ez,
+		double *ax, double *ay, double *az,
+		int idxSourceStart,
+		int idxSourceEnd,
+		int idxEvalStart,
+		int idxEvalEnd,
+		bool useCompensatedSummation);
+
 } // namespace abscab
 
 #endif // ABSCAB_H
